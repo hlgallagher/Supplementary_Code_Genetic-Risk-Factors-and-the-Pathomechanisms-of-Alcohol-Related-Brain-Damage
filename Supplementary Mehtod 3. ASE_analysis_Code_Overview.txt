@@ -112,6 +112,19 @@ wget https://ftp.ncbi.nlm.nih.gov/refseq/H_sapiens/annotation/GRCh38_latest/refs
 samtools faidx GRCh38_latest_genomic.fna
 ## This creates a file GRCh38_latest_genomic.fna.fai
 
+####################################################################################################################################################################
+############ Generate Quality Control Reports ####################
+
+#FastQC#
+#run the following command for all raw read samples#
+fastqc ./<sample_name>.fastq.gz
+
+#MultiQC#
+#generates report of all fastqc reports in a given directory.
+multiqc /path/to/directory/containing/reports
+
+###make adjustments to data based on QC reports as necessary ###
+
 #########################################################################################################################################################################
 ################ Read Alignment With STAR ######################################
 #### Replace <sample_name>  with Sample name for analysis
