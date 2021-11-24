@@ -1,0 +1,486 @@
+### The following is the code used to run an ASE Analysis from publicly available RNA-seq data
+### Data used for our analysis was from the NCBI Sequence Read Archive PRJNA551775, PRJNA530758
+### for analysis, the samples from this database should be downloaded to a working directory prior to the Alignment with STAR step
+### This analysis details the Alignment and Counting Steps for a single sample use case, in the actual project these commands were looped to run across multiple samples rapidly.
+### This process for the ASE analysis was an adapted study for replication of the same study from Rao et al 2021,
+### The final ASE GLM was provided by Andy Chen from the University of Indiana Medical School, Indianopolis. Credit for this code is his. 
+
+
+###############################################################################################################################################################
+############### Preparation of VCF File for ASEReadCounter ####################
+
+
+##Step 1: Download latest VCF + index from dbSNP (GRCh38.p13 build)
+wget https://ftp.ncbi.nih.gov/snp/latest_release/VCF/GCF_000001405.39.gz
+wget https://ftp.ncbi.nih.gov/snp/latest_release/VCF/GCF_000001405.39.gz.tbi
+
+
+##Step 2: Move to bcftools executable directory (install if needed)
+cd /workspace/hugh_project/transcriptomics/tools/bcftools-1.13
+
+##Step 3: Download GRCh38.p13 annotations
+report_dir='ftp://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/000/001/405'
+wget -N "${report_dir}/GCF_000001405.39_GRCh38.p13/GCF_000001405.39_GRCh38.p13_assembly_report.txt"
+
+##Step4: Replace useful columns (NOTE do not replace the columns that have
+# Grab the useful columns
+
+for k in *assembly_report.txt
+  do
+    out=$(echo $k | sed 's/.txt/.chrnames/')
+    grep -e '^[^#]' $k | awk '{ print $7, $1 }' > $out
+	done
+    
+# Annotate (done)
+    ./bcftools annotate \
+  --rename-chrs GCF_000001405.39_GRCh38.p13_assembly_report.chrnames \
+  --threads 10 -Oz \
+  -o GRCh38.dbSNP153_remdup_1.vcf.gz \
+  /workspace/hugh_project/transcriptomics/dbsnp_files/GCF_000001405.39.gz
+  
+## Step5: Extract only Exonic SNPs based of Bed file of Exonic SNPs (done)
+
+	#Download the Exonic SNPs Bed from USCS Genome Browser (BED file, only exonic SNPs)
+
+# reformat header to match vcf
+	sed 's/^chr//'FILE.bed > out.bed
+	
+	#bedtools annotate
+bedtools intersect -a GRCh38.dbSNP153_remdup_1.vcf.gz -b Exonic_SNPs_GENCODEV38_1.bed -u -header > GRCh38.dbSNP153_remdup_2.vcf
+	
+
+## Step6: Sort With BCFTools (Required for ASEReadCounter)
+./bcftools sort /workspace/hugh_project/transcriptomics/dbsnp_files/GRCh38.dbSNP153_remdup_2.vcf > /workspace/hugh_project/transcriptomics/dbsnp_files/GRCh38.dbSNP153_remdup_3.vcf
+
+## Step 7: Rename Chromosomes with BCFtools to match reference genome GRCh38.p13
+./bcftools annotate --rename-chrs Chr_rename_map_to_ref.txt --threads 24 -o /workspace/hugh_project/transcriptomics/dbsnp_files/GRCh38.dbSNP153_remdup_4.vcf /workspace/hugh_project/transcriptomics/dbsnp_files/GRCh38.dbSNP153_remdup_3.vcf
+
+## Step 8: Annotate file with Dummy Genomes (To include for all samples once complete)
+
+cd /workspace/hugh_project/transcriptomics/dbsnp_files
+
+sed '/#CHROM/q' GRCh38.dbSNP153_remdup_4.vcf > GRCh38.dbSNP153_remdup_4_1.vcf
+
+sed -i '$s/$/\tFORMAT\talignedSRR8843030/' GRCh38.dbSNP153_remdup_4_1.vcf
+
+sed -i '1,/#CHROM/d' GRCh38.dbSNP153_remdup_4.vcf
+
+sed -i 's/$/\tGT\t1|0/' GRCh38.dbSNP153_remdup_4.vcf
+
+sudo cat GRCh38.dbSNP153_remdup_4_1.vcf GRCh38.dbSNP153_remdup_4.vcf > GRCh38.dbSNP153_remdup_5.vcf
+
+head -n700 GRCh38.dbSNP153_remdup_5.vcf
+
+## Step 9: Include identifier for GT addition
+
+nano /workspace/hugh_project/transcriptomics/dbsnp_files/GRCh38.dbSNP153_remdup_5.vcf
+ # add line after INFO with:
+ 
+ ##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">
+ 
+ #save file as GRCh38.dbSNP153_remdup_6.vcf
+
+## Step 10: Command to remove SNPs from VCF
+# Note: this could technically be done for all duplicate SNPs however in infeasible given the time constraints.
+# Create a list of SNPS (1 rsID per row with .list naming) for exclusion from the VCF
+./gatk SelectVariants \
+-R GRCh38.p13.genome.fa \
+-V GRCh38.dbSNP153_remdup_6.vcf \
+--select-type-to-include SNP \
+-restrict-alleles-to BIALLELIC \
+-O GRCh38.dbSNP153_remdup_7.vcf
+
+## Step 11: Command to remove duplicates, keeping only the first of the duplcicates in the file 
+(grep  '^#' /workspace/hugh_project/transcriptomics/dbsnp_files/GRCh38.dbSNP153_remdup_9.vcf ; grep -v "^#" /workspace/hugh_project/transcriptomics/dbsnp_files/GRCh38.dbSNP153_remdup_7.vcf | LC_ALL=C sort -t $'\t' -k1,1 -k2,2n | awk -F '\t' 'BEGIN{ prev="";} {key=sprintf("%s\t%s",$1,$2);if(key==prev) next;print;prev=key;}' )  > /workspace/hugh_project/transcriptomics/dbsnp_files/GRCh38.dbSNP153_remdup_8.vcf
+
+## Step 12: Create Index of VCF File
+
+./gatk IndexFeatureFile -I /workspace/hugh_project/transcriptomics/dbsnp_files/GRCh38.dbSNP153_remdup_8.vcf -O /workspace/hugh_project/transcriptomics/dbsnp_files/GRCh38.dbSNP153_remdup_8.vcf.idx
+
+
+#######################################################################################################################################################################
+############### Reference Genome file Preparation ######################
+
+
+wget https://ftp.ncbi.nlm.nih.gov/refseq/H_sapiens/annotation/GRCh38_latest/refseq_identifiers/GRCh38_latest_genomic.fna.gz
+
+## Creating the .dict dictionary file use gatk tools
+./gatk CreateSequenceDictionary -R GRCh38_latest_genomic.fna
+## This creates a file GRCh38_latest_genomic.dict
+
+## Creating the .fai index file using samtools (per GATK Instructions)
+samtools faidx GRCh38_latest_genomic.fna
+## This creates a file GRCh38_latest_genomic.fna.fai
+
+#########################################################################################################################################################################
+################ Read Alignment With STAR ######################################
+#### Replace <sample_name>  with Sample name for analysis
+## This process takes ~ 18 hours per samples using HPC resources, it should be run concurrently on multiple jobs in a HPC. Process for looping or running based off and array are possible but not shown here.
+## Note: STAR requires a GTF file and genome index file, these can be processed using the reference genome (hg38) that is downloaded in the previous step.
+## As these files are based of a standardised refereence file we did not process these files ourselves, rather using pre-exisitng files that had been used in prior projects.
+## To create new index genomes or GTF Files refer to other tutorials on alignment with star such as "https://sydney-informatics-hub.github.io/training-RNAseq/02-BuildAGenomeIndex/index.html"
+
+STAR --runMode alignReads \
+		--readFilesIn <sample_name>_1> <sample_name>_2 \
+		--readFilesCommand zcat \
+		--outFileNamePrefix <sample_name> \
+		--genomeDir ${indexDir} \
+		--sjdbGTFfile ${gtfDir} \
+		--outSJfilterReads Unique \
+		--sjdbOverhang 82 \
+		--twopassMode Basic \
+		--runThreadN ${numcores:=6} \
+		--genomeLoad NoSharedMemory \
+		--outFilterType BySJout \
+		--outFilterMultimapNmax 100 \
+		--outFilterMismatchNmax 33 \
+		--outFilterMatchNminOverLread 0 \
+		--outFilterMismatchNoverLmax 0.3 \
+		--outFilterScoreMinOverLread 0.3 \
+		--limitOutSJcollapsed 1000000 \
+		--limitSjdbInsertNsj 1000000 \
+		--alignEndsType EndToEnd \
+		--alignSJDBoverhangMin 3  \
+		--alignSJoverhangMin 8 \
+		--alignIntronMin 20 \
+		--winAnchorMultimapNmax 50 \
+		--seedSearchStartLmax 12 \
+		--chimSegmentMin 20 \
+		--outSAMattributes All \
+		--outSAMstrandField intronMotif \
+		--quantMode TranscriptomeSAM \
+		--outSAMattrIHstart 0 \
+		--outSAMunmapped Within \
+		--outSAMtype BAM SortedByCoordinate"
+
+STAR --runMode alignReads \
+	--readFilesIn $inFile1 $inFile2 \
+	--readFilesCommand zcat \
+	--outFileNamePrefix <sample_name> \
+	--genomeDir ${indexDir} \
+	--sjdbGTFfile ${gtfDir} \
+	--outSJfilterReads Unique \
+	--sjdbOverhang 100 \
+	--twopassMode Basic \
+	--runThreadN ${numcores} \
+	--genomeLoad NoSharedMemory \
+	--outFilterType BySJout \
+	--outFilterMultimapNmax 100 \
+	--outFilterMismatchNmax 33 \
+	--outFilterMatchNminOverLread 0 \
+	--outFilterMismatchNoverLmax 0.3 \
+	--outFilterScoreMinOverLread 0.3 \
+	--limitOutSJcollapsed 1000000 \
+	--limitSjdbInsertNsj 1000000 \
+	--alignEndsType EndToEnd \
+	--alignSJDBoverhangMin 3  \
+	--alignSJoverhangMin 8 \
+	--alignIntronMin 20 \
+	--winAnchorMultimapNmax 50 \
+	--seedSearchStartLmax 12 \
+	--chimSegmentMin 20 \
+	--outSAMattributes All \
+	--outSAMstrandField intronMotif \
+	--quantMode TranscriptomeSAM \
+	--outSAMattrIHstart 0 \
+	--outSAMunmapped Within \
+	--outSAMtype BAM SortedByCoordinate
+
+	
+## Output will produce multiple files as it is used as a pre-processing step for multiple RNA-seq pipelines
+## file of interest is in the format: <sample_name>Aligned.sortedByCoord.out.bam
+## This file is used as the input foor ASEReadCounter
+## This process will need to be run on all samples of interest, this code is the base command to run on a single sample for purposes of showing methodology.
+
+##################################################################################################################################################################################################################
+########## Allele Counting in ASEReadCounter ######################3
+
+gatk AddOrReplaceReadGroups \
+I=$inDir/${1}_star/${1}Aligned.sortedByCoord.out.bam \
+O=$resDir/${1}Aligned.sortedByCoord.out.rg.bam \
+RGID=${1} \
+RGLB=lib1 \
+RGPL=illumina \
+RGPU=unit1 \
+RGSM=${1}
+
+gatk ASEReadCounter \
+-R $indexDir/GRCh38.p13.genome.fa \
+-I $resDir/${1}Aligned.sortedByCoord.out.rg.bam \
+-V $indexDir/GRCh38.dbSNP153_remdup_8.vcf \
+-O $resDir/ASEReadCounter_counts \
+-DF NotDuplicateReadFilter
+
+## Output file will be <sample_name>ASEReadCounter_counts 
+## This process will need to be run on all samples of interest, this code is the base command to run on a single sample for purposes of showing methodology.
+
+###################################################################################################################################################################################################################
+########## Labelling and Extracting Variants with Sufficient Heterozygosity ##################################
+
+############# Labelling Heterozygous SNPs per status group ################33
+
+!/bin/bash  
+## declare an array variable
+### add all sample names relevant for analysis to here (seperateing groups for AUD and control)
+declare -a arr=("SRR9613885"
+"SRR9613887"
+"SRR9613889"
+"SRR9613891"
+"SRR9613893"
+"SRR9613897"
+"SRR9613899"
+"SRR9613901"
+"SRR9613903"
+"SRR9613907"
+"SRR9613909"
+"SRR9613910"
+"SRR9613911"
+"SRR9613913"
+"SRR9613915"
+"SRR9613917"
+"SRR9613919"
+"SRR9613921"
+"SRR9613923"
+"SRR9613925"
+"SRR9613927"
+"SRR9613934")
+
+## now loop through the above array
+for sample in "${arr[@]}"
+do
+   echo "Processing $sample"
+
+#output header of original file to new file
+sed -n 1p ${sample}_ASEReadCounter_counts > ${sample}_ASEReadCounter_counts_1header
+
+#add new column headers 'percentage' and 'heterozygous'
+sed -i '1s/$/\tpercentage\theterozygous\thetand10/' ${sample}_ASEReadCounter_counts_1header
+
+# output original file to new file without header
+
+sed 1d ${sample}_ASEReadCounter_counts > ${sample}_ASEReadCounter_counts_2removed
+
+#calculate percentages and write to new column
+
+sed 's/$/\t0/' ${sample}_ASEReadCounter_counts_2removed > ${sample}_ASEReadCounter_counts_3percentages1 ##initially add default 0 value to column 8 so that percentages not assigned in the next step are not a missing value
+awk '$8>0{$14=100*$7/$8}1' ${sample}_ASEReadCounter_counts_3percentages1 > ${sample}_ASEReadCounter_counts_3percentages2
+sed -i 's/ /\t/g' ${sample}_ASEReadCounter_counts_3percentages2 #convert spaces back into tabs
+
+#calculate if in acceptable range of >10% and <90% to determine heterozygosity (1 = heterozygous)
+
+awk '{
+if ($14 >10 && $14 <90)
+	print $0,"\t1";
+else
+	print $0,"\t0";
+}' ${sample}_ASEReadCounter_counts_3percentages2 > ${sample}_ASEReadCounter_counts_4range
+
+#calculate if rsid is valid for comparison between samples by ensuring total read counts are >10 and heterozgosity is true (1 = valid)
+
+awk '{
+if ($8 >10 && $15==1)
+        print $0,"\t1";
+else
+        print $0,"\t0";
+}' ${sample}_ASEReadCounter_counts_4range > ${sample}_ASEReadCounter_counts_5valid
+
+#merge column headings with main file
+cat ${sample}_ASEReadCounter_counts_1header ${sample}_ASEReadCounter_counts_5valid > ${sample}_ASEReadCounter_processed
+
+#housecleaning to delete intermediate files generated during testing and move final file to new dir
+rm ${sample}*counts_*
+mv ${sample}_ASEReadCounter_processed ./output
+
+done
+
+#!/bin/bash  
+
+#remove header from processed files so that datamash will function
+sed -i 1d *_processed
+
+#sum all rsids that are valid (heterozygous and >10 total reads) across all samples by group(!) to identify those occurring across 5 or more samples and write to total count file
+sort *_processed | datamash groupby 3 sum 16 > total_counts
+
+#sort final datamash output file
+sort -k 1b,1 total_counts > total_counts_sorted
+
+#array starts
+
+#################### Filtering adding labels to variants with valid heterozygosity rates for ASE #####################
+# declare an array variable
+declare -a arr=("SRR9613885"
+"SRR9613887"
+"SRR9613889"
+"SRR9613891"
+"SRR9613893"
+"SRR9613897"
+"SRR9613899"
+"SRR9613901"
+"SRR9613903"
+"SRR9613907"
+"SRR9613909"
+"SRR9613910"
+"SRR9613911"
+"SRR9613913"
+"SRR9613915"
+"SRR9613917"
+"SRR9613919"
+"SRR9613921"
+"SRR9613923"
+"SRR9613925"
+"SRR9613927"
+"SRR9613934")
+
+# loop through the above array
+for sample in "${arr[@]}"
+do
+   echo "Processing $sample"
+
+#line count and assign to end of each line as field to revert back to original order
+awk '{ print $0, NR }' ${sample}_ASEReadCounter_processed > ${sample}_ASEReadCounter_processed_count
+
+#swap columns in main sample file so that rsid is column 1 in preparation for sorting
+awk '{swap=$1;$1=$3;$3=swap;print $0}' ${sample}_ASEReadCounter_processed_count  >${sample}_ASEReadCounter_processed_swap
+
+#sort file based off rsid field in order to join with total_counts_sorted
+sort -k 1b,1 ${sample}_ASEReadCounter_processed_swap > ${sample}_ASEReadCounter_processed_swap_sorted
+
+#merge sorted total counts with sorted sample file on key field rsid
+join -1 1 -2 1 ${sample}_ASEReadCounter_processed_swap_sorted total_counts_sorted > ${sample}_ASEReadCounter_processed_assigned
+
+#revert to original order
+sort -k17 -n ${sample}_ASEReadCounter_processed_assigned > ${sample}_ASEReadCounter_processed_assigned_ordered1
+
+#rever columns to original column
+awk '{swap=$1;$1=$3;$3=swap;print $0}' ${sample}_ASEReadCounter_processed_assigned_ordered1 > ${sample}_ASEReadCounter_processed_assigned_ordered2
+
+#delete unnecessary count column
+cut --complement -d " " -f17 ${sample}_ASEReadCounter_processed_assigned_ordered2 > ${sample}_ASEReadCounter_final
+
+#fix spaces > tabs
+sed -i 's/ /\t/g' ${sample}_ASEReadCounter_final #convert spaces back into tabs
+
+#restores original headers
+sed -i '1i\contig\tposition\tvariantID\trefAllele\taltAllele\trefCount\ttotalCount\tlowMAPQDepth\tlowBaseQDepth\trawDepth\totherBases\timproperPairs\tpercentage\theterozygous\thetand10\ttotalCountsAcrossAll' ${sample}_ASEReadCounter_final
+
+#filters output file to only include group reads >=5 & valid results
+awk '{ if($17 >= 5) { print } }' ${sample}_ASEReadCounter_final > ${sample}_ASEReadCounter_filtered.table
+
+#housecleaning to delete intermediate files generated during testing
+rm ${sample}_ASEReadCounter_processed_count ${sample}_ASEReadCounter_processed_swap ${sample}_ASEReadCounter_processed_swap_sorted ${sample}_ASEReadCounter_processed_assigned ${sample}_ASEReadCounter_processed_assigned_ordered1 ${sample}_ASEReadCounter_processed_assigned_ordered2
+
+done
+
+#### Reformat headers ######
+for sample in "${arr[@]}"
+do
+   echo "Processing $sample"
+
+#fix spaces > tabs
+sed -i 's/ /\t/g' ${sample}_ASEReadCounter_filtered.table #convert spaces back into tabs
+
+#restores original headers
+sed -i "1i\contig\tposition\tvariantID\trefAllele\taltAllele\t${sample}_refCount\t${sample}_altCount\ttotalCount\tlowMAPQDepth\tlowBaseQDepth\trawDepth\totherBases\timproperPairs\tpercentage\theterozygous\thetand10\ttotalCountsAcrossAll" ${sample}_ASEReadCounter_filtered.table
+
+done
+
+##################### Data Transformation to compatible format. ##############
+##Once All Counts are finalised data must be combined into a single .csv file.
+## Example files for the final formatting for the ASE analysis can be found on the gitub under counts_test.csv, genotypees_test.csv
+## Using excel vlookup command and excel filters we combined the reference and allele counts for all samples for every valid SNP, and the genotype status (0/0 homozyogus, 0/1 heterozygous) for every valid SNP.
+## for the ASE of BTRC tissue we used Microsoft Excel to combine all files and then produce count and genotype files in the following format:
+## Example files for the final formatting for the ASE analysis can be found on the gitub under counts_test.csv, genotypees_test.csv
+## Using excel vlookup command and excel filters we combined the reference and allele counts for all samples for every valid SNP, and the genotype status (0/0 homozyogus, 0/1 heterozygous) for every valid SNP.
+###Count:
+	#variantID,SRR8843017_refCount,SRR8843017_altCount,SRR8843018_refCount,SRR8843018_altCount,SRR8843019_refCount.......
+	#rs1640225244,23,4,3,2,12,0,28,5,23,5,21,2,32,0,20,0,12,3...........
+	
+### Genotype:
+	#variantID,SRR8843017,SRR8843018 ,SRR8843019,SRR8843020 ,SRR8843021,SRR8843022,SRR8843023,
+	#rs1359035398,0/1,0/1,0/1,0/1,0/1,0/1,0/1,0/1,0/1,0/1,0/1,0/1
+	
+#########################################################################################################################################################################################################################	
+### ASE analysis -glm model
+### This model was provide by Andy Chen at the University of Indiana Medical School, Indianopolis. All credit for this model goes to him.
+## This code can be executed via the -Rscript command in a unix environment, or using an R project environment such as R-Studio
+## run-time for this is ~ 20 hours.
+
+-Rscript(
+
+library(lme4)
+
+setwd ("C:/Users/hlgal/Documents_Local/ase")
+
+
+# extracts coefficient and p-value corresponding to group:allele interaction
+# returns NA if model fails to converge
+glmCal = function(expr,coefnm){
+  est=NA
+  pvalue=NA
+  fit_res = try(withWarnings(expr), FALSE)
+  if(sum(grepl("Error", fit_res))==0) {
+    fit = try(fit_res$value)
+    warns = sum(unlist(lapply(fit_res$warnings, function(x) {
+      y=unlist(x)
+      grepl("NaNs produced", y) |
+        grepl("glm.fit: algorithm did not converge", y) |
+        grepl("Model failed to converge",y)|
+        grepl("Model is nearly unidentifiable",y)})))
+    if(warns==0){
+      est <- summary(fit)$coefficients[grepl(coefnm, names(summary(fit)$coefficients[,4])), 1]
+      pvalue <- summary(fit)$coefficients[grepl(coefnm, names(summary(fit)$coefficients[,4])), 4]
+    }
+  }
+  list(est=est, pvalue=pvalue)
+}
+
+#error handling function
+withWarnings <- function(expr) {
+  myWarnings <- NULL
+  wHandler <- function(w) {
+    myWarnings <<- c(myWarnings, list(w))
+    invokeRestart("muffleWarning")
+  }
+  val <- withCallingHandlers(expr, warning = wHandler)
+  list(value = val, warnings = myWarnings)
+}
+
+
+# counts: matrix where each row is a variant loci, each column is sample REF or ALT, values are allele count
+# 	columns grouped by sample, so SAMP1_REF SAMP1_ALT SAMP2_REF SAMP2_ALT, etc.
+# vcf: matrix of genotypes, row is variant, column is sample; "0/1" = heterozygous
+# these variants were already pre-screened to have at least 5 heterozygous samples in each group with 10 or more total reads (REF+ALT)
+# samples assumed to be distributed 30 AUD then 30 Control
+
+get_aseres = function(counts,vcf) {
+  aseres = matrix(NA,nrow(counts),2)
+  rownames(aseres) = rownames(counts)
+  for (i in rownames(counts)){
+    ref = counts[i,2*(1:60)-1] # extract REF counts (assumes 60 samples)
+    alt = counts[i,2*(1:60)] # extract ALT counts
+    idx <- (!is.na(ref)) & (!is.na(alt)) & vcf[i,] == '0/1' & colSums(rbind(as.vector(t(ref)),as.vector(t(alt))), na.rm=T) >= 10 # extracts heterozygous samples with depth 10+
+    group = factor(rep(c('Alcohol','Control'),times=30)[idx],levels=c("Control", "Alcohol"))
+    if( sum(table(group) > 0) == 2) {
+      dat = data.frame(counts = c(ref[idx],alt[idx]),
+                       genotype = factor(c(rep("REF", 60)[idx], rep("ALT", 60)[idx]),
+                                         levels = c("REF", "ALT")),
+                       sample = factor(rep(c(1:60)[idx], times=2)),
+                       group = rep(group, 2))
+      fit = glmCal(glmer.nb(counts ~ (1|sample) + genotype + group + group:genotype, data=dat, control=glmerControl(optimizer = "bobyqa")),'genotypeALT:groupAlcohol') # genotypeALT:groupAlcohol is the name of the desired coefficient
+      aseres[i,] = unlist(fit)
+    }
+  }
+  return(aseres)
+}
+
+counts = read.csv('Counts_2.csv',row.names=1)
+vcf = read.csv('Genotypes_2.csv',row.names=1)
+ASE_results = get_aseres(counts,vcf) )
+
+##### This will produce an object in R called ASE_results which can be written to a file for local storage.
+##### This is run on single tissues samples at one time.
+##### This file constitutes the final raw results for the ASE analysis
+
+
+#########################################################################################################################################################################################
+############### END ANALYSIS #################################################################################################################################################################
